@@ -334,6 +334,8 @@ typedef EnumDecl =
   > ModuleType,
   var fields:Array<EnumFieldDecl>;
   @:optional var pkg:Array<String>;
+  @:optional var imports:Map<String, ClassImport>;
+  @:optional var importsToValidate:Map<String, ClassImport>;
 }
 
 typedef EnumFieldDecl =

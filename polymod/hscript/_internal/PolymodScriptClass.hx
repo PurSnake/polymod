@@ -1189,6 +1189,7 @@ class PolymodScriptClass
 
   public function callFunction(fnName:String, ?args:Array<Dynamic>):Null<Dynamic>
   {
+    if (args == null) args = [];
     var field = findField(fnName);
     var fn = (field != null) ? findFunction(fnName) : null;
 
@@ -1201,7 +1202,9 @@ class PolymodScriptClass
         {
           if(_interp.functions.exists(fnName))
           {
+            _interp.assertScriptFunctionArguments(fn, args, fnName);
             r = Reflect.callMethod(this, _interp.functions.get(fnName), args);
+            r = _interp.assertScriptFunctionReturn(fn, r, fnName);
           }
           else
           {

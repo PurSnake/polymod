@@ -174,6 +174,7 @@ abstract PolymodAbstractScriptClass(PolymodScriptClass) from PolymodScriptClass
     if (this.findVar(name) != null)
     {
       var decl = this.findVar(name, true);
+      value = this._interp.assertRuntimeType(value, decl.type, 'field "${this.fullyQualifiedName}.${name}"');
       if (decl.isfinal && decl.expr != null) // The variable already exists and has a set value.
       {
         return this._interp.error(EInvalidFinalSet(name));

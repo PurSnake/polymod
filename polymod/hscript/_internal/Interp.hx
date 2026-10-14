@@ -117,6 +117,7 @@ class Interp
 
   public var variables:Map<String, Dynamic>;
   public var functions:Map<String, Dynamic>;
+  var variableTypes:Map<String, CType> = new Map<String, CType>();
   var currentFunction:Null<String> = null;
   var locals:Map<String, LocalVar>;
   var binops:Map<String, Expr->Expr->Dynamic>;
@@ -592,6 +593,7 @@ class Interp
    */
   public function callScriptClassStaticFunction(clsName:String, fnName:String, args:Array<Dynamic> = null):Null<Dynamic>
   {
+    if (args == null) args = [];
     // For functions listScriptClasses and scriptInit, we want to return the needed values without much checking.
     if (fnName == "listScriptClasses")
     {
@@ -689,7 +691,9 @@ class Interp
           var prefixedName = '$clsName#$fnName';
           if (this.functions.exists(prefixedName))
           {
+            assertScriptFunctionArguments(fn, args, fnName);
             result = Reflect.callMethod(this, this.functions.get(prefixedName), args);
+            result = assertScriptFunctionReturn(fn, result, fnName);
           }
           else
           {
@@ -704,10 +708,12 @@ class Interp
       catch (err:Expr.Error)
       {
         PolymodScriptClass.reportError(err, clsName, fnName);
-        // A script error occurred while executing the script function.
-        // Purge the function from the cache so it is not called again.
-        // purgeStaticFunction(fnName);
-        return null;
+        result = null;
+      }
+      catch (err:Dynamic)
+      {
+        this._classDeclOverride = previousClassDecl;
+        throw err;
       }
 
       this._classDeclOverride = previousClassDecl;
@@ -861,7 +867,7 @@ class Interp
   private static function registerScriptEnum(e:EnumDecl)
   {
     var name = e.name;
-    if (e.pkg != null)
+    if (e.pkg != null && e.pkg.length > 0)
     {
       name = e.pkg.join(".") + "." + name;
     }
@@ -910,6 +916,7 @@ class Interp
   private function resetVariables()
   {
     variables = new Map<String, Dynamic>();
+    variableTypes = new Map<String, CType>();
     variables.set("null", null);
     variables.set("true", true);
     variables.set("false", false);
@@ -1105,9 +1112,23 @@ class Interp
       }
     }
 
-    if (_proxy != null && _proxy.fieldExists(id) || variables.exists(id))
+    if ((_proxy != null && _proxy.fieldExists(id)) || variables.exists(id))
     {
-      // Fallback to setting in local scope.
+      var fieldDecl = _proxy == null ? null : _proxy.findVar(id, true);
+      if (fieldDecl != null)
+      {
+        v = assertRuntimeType(v, fieldDecl.type, 'field "${_proxy.fullyQualifiedName}.${id}"');
+      }
+      else if (variables.exists(id))
+      {
+        var globalType = variableTypes.get(id);
+        if (globalType == null)
+        {
+          globalType = inferRuntimeType(variables.get(id)) ?? inferRuntimeType(v);
+          if (globalType != null) variableTypes.set(id, globalType);
+        }
+        if (globalType != null) v = assertRuntimeType(v, globalType, 'global variable "${id}"');
+      }
       variables.set(id, v);
       return v;
     }
@@ -1165,7 +1186,9 @@ class Interp
       {
         this.declared.push({ n: a.name, old: this.locals.get(a.name) });
       }
-      this.locals.set(a.name, { r: value });
+      if (a.t != null && (value != null || a.opt != true))
+        assertRuntimeType(value, a.t, 'argument "${a.name}" of ${name}');
+      this.locals.set(a.name, {r: value, t: a.t});
       i++;
     }
   }
@@ -1205,6 +1228,7 @@ class Interp
 
               if (decl != null)
               {
+                v = assertRuntimeType(v, decl.type, 'field "${_proxy.fullyQualifiedName}.${id}"');
                 switch (decl.set)
                 {
                   case "set":
@@ -1292,6 +1316,8 @@ class Interp
             if (ref == null) ref = PolymodStaticClassReference.tryBuild(importedClass.pkg.join('.'));
             if (ref != null)
             {
+              var expectedType = runtimeMemberType(CTPath(importedClass.fullPath.split('.')), path[path.length - 1], true);
+              if (expectedType != null) v = assertRuntimeType(v, expectedType, 'static field "${importedClass.fullPath}.${path[path.length - 1]}"');
               return set(ref, path[path.length - 1], v);
             }
           }
@@ -1310,6 +1336,8 @@ class Interp
           var fullClassName:String = getClassFullyQualifiedName();
           if (PolymodScriptClass.hasScriptClassStaticField(fullClassName, id))
           {
+            var expectedType = runtimeMemberType(CTPath(fullClassName.split('.')), id, true);
+            if (expectedType != null) v = assertRuntimeType(v, expectedType, 'static field "${fullClassName}.${id}"');
             return PolymodScriptClass.setScriptClassStaticField(fullClassName, id, v);
           }
 
@@ -1317,8 +1345,16 @@ class Interp
           setVar(id, v);
         }
         else
+        {
+          if (l.t == null) l.t = inferRuntimeType(v);
+          else assertRuntimeType(v, l.t, 'local variable "${id}"');
           l.r = v;
+        }
       case EField(e0, id):
+        var expectedFieldType = runtimeMemberType(runtimeExpressionType(e0), id, runtimeTypeReferenceExpression(e0));
+        if (expectedFieldType != null)
+          v = assertRuntimeType(v, expectedFieldType, 'field "${id}"');
+
         // Make sure setting superclass fields works when using this.
         // Also ensures property functions are accounted for.
         switch (Tools.expr(e0))
@@ -1375,14 +1411,21 @@ class Interp
         v = set(fieldTarget(e0), id, v);
       case EArray(e, index):
         var arr:Dynamic = expr(e);
-        var index:Dynamic = expr(index);
+        var indexValue:Dynamic = expr(index);
+        var collectionType = runtimeExpressionType(e);
         if (isMap(arr))
         {
-          setMapValue(arr, index, v);
+          var keyType = runtimeIndexedKeyType(collectionType);
+          var valueType = runtimeIndexedValueType(collectionType);
+          if (keyType != null) indexValue = assertRuntimeType(indexValue, keyType, 'map key');
+          if (valueType != null) v = assertRuntimeType(v, valueType, 'map value');
+          setMapValue(arr, indexValue, v);
         }
         else
         {
-          arr[index] = v;
+          var elementType = runtimeIndexedValueType(collectionType);
+          if (elementType != null) v = assertRuntimeType(v, elementType, 'array element');
+          arr[indexValue] = v;
         }
 
       default:
@@ -1472,22 +1515,35 @@ class Interp
         }
         if (l == null) setVar(id, v)
         else
+        {
+          if (l.t == null) l.t = inferRuntimeType(v);
+          else v = assertRuntimeType(v, l.t, 'local variable "${id}"');
           l.r = v;
+        }
       case EField(e, f):
         var obj = fieldTarget(e);
         v = fop(get(obj, f), expr(e2));
+        var expectedType = runtimeMemberType(runtimeExpressionType(e), f, runtimeTypeReferenceExpression(e));
+        if (expectedType != null) v = assertRuntimeType(v, expectedType, 'field "${f}"');
         v = set(obj, f, v);
       case EArray(e, index):
         var arr:Dynamic = expr(e);
         var index:Dynamic = expr(index);
+        var collectionType = runtimeExpressionType(e);
         if (isMap(arr))
         {
+          var keyType = runtimeIndexedKeyType(collectionType);
+          var valueType = runtimeIndexedValueType(collectionType);
+          if (keyType != null) index = assertRuntimeType(index, keyType, 'map key');
           v = fop(getMapValue(arr, index), expr(e2));
+          if (valueType != null) v = assertRuntimeType(v, valueType, 'map value');
           setMapValue(arr, index, v);
         }
         else
         {
           v = fop(arr[index], expr(e2));
+          var elementType = runtimeIndexedValueType(collectionType);
+          if (elementType != null) v = assertRuntimeType(v, elementType, 'array element');
           arr[index] = v;
         }
       default:
@@ -1567,50 +1623,76 @@ class Interp
           v += delta;
           if (l == null) setVar(id, v)
           else
+          {
+            if (l.t != null) v = assertRuntimeType(v, l.t, 'local variable "${id}"');
             l.r = v;
+          }
         }
         else if (l == null) setVar(id, v + delta)
         else
-          l.r = v + delta;
+        {
+          var nextValue:Dynamic = v + delta;
+          if (l.t != null) nextValue = assertRuntimeType(nextValue, l.t, 'local variable "${id}"');
+          l.r = nextValue;
+        }
         return v;
       case EField(e, f):
         var obj = fieldTarget(e);
         var v:Dynamic = get(obj, f);
+        var expectedType = runtimeMemberType(runtimeExpressionType(e), f, runtimeTypeReferenceExpression(e));
         if (prefix)
         {
           v += delta;
+          if (expectedType != null) v = assertRuntimeType(v, expectedType, 'field "${f}"');
           set(obj, f, v);
         }
         else
-          set(obj, f, v + delta);
+        {
+          var nextValue:Dynamic = v + delta;
+          if (expectedType != null) nextValue = assertRuntimeType(nextValue, expectedType, 'field "${f}"');
+          set(obj, f, nextValue);
+        }
         return v;
       case EArray(e, index):
         var arr:Dynamic = expr(e);
         var index:Dynamic = expr(index);
+        var collectionType = runtimeExpressionType(e);
         if (isMap(arr))
         {
           var v = getMapValue(arr, index);
+          var keyType = runtimeIndexedKeyType(collectionType);
+          var valueType = runtimeIndexedValueType(collectionType);
+          if (keyType != null) index = assertRuntimeType(index, keyType, 'map key');
           if (prefix)
           {
             v += delta;
+            if (valueType != null) v = assertRuntimeType(v, valueType, 'map value');
             setMapValue(arr, index, v);
           }
           else
           {
-            setMapValue(arr, index, v + delta);
+            var nextValue:Dynamic = v + delta;
+            if (valueType != null) nextValue = assertRuntimeType(nextValue, valueType, 'map value');
+            setMapValue(arr, index, nextValue);
           }
           return v;
         }
         else
         {
           var v = arr[index];
+          var elementType = runtimeIndexedValueType(collectionType);
           if (prefix)
           {
             v += delta;
+            if (elementType != null) v = assertRuntimeType(v, elementType, 'array element');
             arr[index] = v;
           }
           else
-            arr[index] = v + delta;
+          {
+            var nextValue:Dynamic = v + delta;
+            if (elementType != null) nextValue = assertRuntimeType(nextValue, elementType, 'array element');
+            arr[index] = nextValue;
+          }
           return v;
         }
       default:
@@ -1651,6 +1733,25 @@ class Interp
     return exprReturn(expr);
   }
 
+  public function assertScriptFunctionArguments(fn:FunctionDecl, args:Array<Dynamic>, fnName:String):Void
+  {
+    if (args == null) args = [];
+    validateArgumentCount(fn.args, args, fnName);
+    for (i in 0...fn.args.length)
+    {
+      if (i >= args.length) break;
+      var arg = fn.args[i];
+      if (arg.t != null && (args[i] != null || arg.opt != true))
+        assertRuntimeType(args[i], arg.t, 'argument "${arg.name}" of ${fnName}');
+    }
+  }
+
+  public function assertScriptFunctionReturn(fn:FunctionDecl, value:Dynamic, fnName:String):Dynamic
+  {
+    if (fn.ret != null) assertRuntimeType(value, fn.ret, 'return value of ${fnName}');
+    return value;
+  }
+
   public function executeFunction(fn:FunctionDecl, fnName:String, args:Array<Dynamic>):Dynamic
   {
     var oldDepth:Int = this.depth;
@@ -1663,13 +1764,13 @@ class Interp
     this.depth++;
     this.currentFunction = fnName;
 
-    setFunctionValues(fn, args, fnName, false);
-
     var result:Null<Dynamic> = null;
     var exception:Null<Dynamic> = null;
     try
     {
+      setFunctionValues(fn, args, fnName, false);
       result = exprReturn(fn.expr);
+      if (fn.ret != null) assertRuntimeType(result, fn.ret, 'return value of ${fnName}');
     }
     catch (err:Dynamic)
     {
@@ -2169,7 +2270,8 @@ class Interp
 
         locals.set(name, {
           r: result,
-          isfinal: false
+          isfinal: false,
+          t: type ?? (expression == null ? null : runtimeExpressionType(expression)) ?? inferRuntimeType(result)
         });
 
         return null;
@@ -2184,7 +2286,8 @@ class Interp
 
         locals.set(name, {
           r: result,
-          isfinal: true
+          isfinal: true,
+          t: type ?? (expression == null ? null : runtimeExpressionType(expression)) ?? inferRuntimeType(result)
         });
 
         return null;
@@ -2230,6 +2333,7 @@ class Interp
             error(EInvalidOp(op));
         }
       case ECall(e, params):
+        var callableType = runtimeExpressionType(e);
         switch (Tools.expr(e))
         {
           case EField(e, f):
@@ -2268,10 +2372,12 @@ class Interp
 
             if (abs != null && abs.hasInlineFunction(f))
             {
-              var args = new Array();
+              var args = new Array<Dynamic>();
               for (p in params) args.push(expr(p));
-
-              return abs.callInlineFunction(this, params[0], f, args);
+              var returnType = assertRuntimeCallArguments(callableType, args, Printer.toString(e));
+              var result = abs.callInlineFunction(this, params[0], f, args);
+              if (returnType != null) result = assertRuntimeType(result, returnType, 'return value of ${Printer.toString(e)}');
+              return result;
             }
           default:
         }
@@ -2296,15 +2402,19 @@ class Interp
           args.push(expr(p));
         }
 
+        var returnType = assertRuntimeCallArguments(callableType, args, Printer.toString(e));
+        var result:Dynamic;
         switch (Tools.expr(e))
         {
           case EField(e, f):
             var obj = fieldTarget(e);
             if (obj == null) error(ENullObjectReference(f));
-            return fcall(obj, f, args);
+            result = fcall(obj, f, args);
           default:
-            return call(null, expr(e), args);
+            result = call(null, expr(e), args);
         }
+        if (returnType != null) result = assertRuntimeType(result, returnType, 'return value of ${Printer.toString(e)}');
+        return result;
       case EIf(econd, e1, e2):
         return if (expr(econd) == true) expr(e1) else if (e2 == null) null else expr(e2);
       case EWhile(econd, e):
@@ -2339,11 +2449,13 @@ class Interp
       case EReturn(e):
         returnValue = e == null ? null : expr(e);
         throw SReturn;
-      case EFunction(params, fexpr, name, _):
+      case EFunction(params, fexpr, name, ret):
         var capturedLocals = duplicate(this.locals);
         var capturedCallObject = this._nextCallObject;
         var capturedClassDeclOverride = this._classDeclOverride;
         var capturedFunctionName = this.currentFunction;
+        var inferredArgumentTypes:Array<Null<CType>> = [for (param in params) param.t];
+        var inferredReturnType:Null<CType> = ret;
         var me = this;
 
         // This CREATES a new function in memory, that we call later.
@@ -2395,14 +2507,8 @@ class Interp
 
           name ??= capturedFunctionName;
 
-          for (i in 0...params.length)
-          {
-            me.locals.set(params[i].name, {
-              r: args[i]
-            });
-          }
           var oldDecl = declared.length;
-          var r = null;
+          var r:Dynamic = null;
 
           inline function restoreContext()
           {
@@ -2413,40 +2519,49 @@ class Interp
             me._classDeclOverride = oldClsDeclOverride;
           }
 
-          if (inTry)
+          try
           {
-            // True if the SCRIPT wraps the function in a try/catch block.
-            try
+            for (i in 0...params.length)
             {
-              r = me.exprReturn(fexpr);
+              var argType = inferredArgumentTypes[i];
+              if (argType != null)
+                me.assertRuntimeType(args[i], argType, 'argument "${params[i].name}" of ${name}');
+              else
+              {
+                argType = me.inferRuntimeType(args[i]);
+                inferredArgumentTypes[i] = argType;
+              }
+              me.locals.set(params[i].name, {
+                r: args[i],
+                t: argType
+              });
             }
-            catch (e:Dynamic)
+            r = me.exprReturn(fexpr);
+            if (inferredReturnType != null)
+              me.assertRuntimeType(r, inferredReturnType, 'return value of ${name}');
+            else
             {
-              restoreContext();
-              #if neko
-              neko.Lib.rethrow(e);
-              #else
-              throw e;
-              #end
+              inferredReturnType = me.inferRuntimeType(r);
             }
           }
-          else
+          catch (err:Dynamic)
           {
-            // There is no try/catch block. We can add some custom error handling.
-            try
+            restoreContext();
+            if (me.isRuntimeTypeMismatchError(err)) throw err;
+            if (inTry)
             {
-              r = me.exprReturn(fexpr);
-            }
-            catch (err:Expr.Error)
-            {
-              PolymodScriptClass.reportError(err, getClassFullyQualifiedName(), name);
-              r = null;
-            }
-            catch (err:Dynamic)
-            {
-              restoreContext();
+              #if neko
+              neko.Lib.rethrow(err);
+              #else
               throw err;
+              #end
             }
+            if (Std.isOfType(err, Error))
+            {
+              PolymodScriptClass.reportError(cast err, getClassFullyQualifiedName(), name);
+              return null;
+            }
+            throw err;
           }
 
           restoreContext();
@@ -2461,7 +2576,8 @@ class Interp
             old: locals.get(name)
           });
           var ref = {
-            r: newFun
+            r: newFun,
+            t: inferRuntimeType(newFun)
           };
           locals.set(name, ref);
           capturedLocals.set(name, ref); // allow self-recursion
@@ -2617,10 +2733,639 @@ class Interp
           default:
             return expr(e);
         }
-      case ECheckType(e, _):
-        return expr(e);
+      case ECheckType(e, type):
+        return exprWithType(e, type);
     }
     return null;
+  }
+
+  /**
+   * Enforce a source-level type at interpreter boundaries.
+   */
+  public function assertRuntimeType(value:Dynamic, type:Null<CType>, context:String):Dynamic
+  {
+    #if POLYMOD_STRICT_SYNTAX
+    if (type == null || runtimeTypeMatches(value, type, 0)) return value;
+
+    var expected = new Printer().typeToString(type);
+    var actual:String;
+    if (value == null)
+      actual = 'Null';
+    else if (Std.isOfType(value, PolymodEnum.PolymodEnumValue))
+      actual = (cast value:PolymodEnum.PolymodEnumValue).parentEnum.getFullName();
+    else
+      actual = Util.getTypeNameOf(value);
+    return error(ECustom('Type mismatch for ${context}: expected ${expected}, got ${actual}.'));
+    #else
+    return value;
+    #end
+  }
+
+  function isRuntimeTypeMismatchError(err:Dynamic):Bool
+  {
+    return Std.string(err).indexOf('Type mismatch for ') >= 0;
+  }
+
+  function inferRuntimeType(value:Dynamic):Null<CType>
+  {
+    if (value == null) return null;
+    if (Std.isOfType(value, String)) return CTPath(['String']);
+    if (Std.isOfType(value, Bool)) return CTPath(['Bool']);
+    if (Std.isOfType(value, Array))
+    {
+      var elementType:Null<CType> = null;
+      for (item in (cast value:Array<Dynamic>))
+        elementType = mergeInferredRuntimeTypes(elementType, inferRuntimeType(item));
+      return CTPath(['Array'], [elementType ?? CTPath(['Dynamic'])]);
+    }
+    if (isMap(value))
+    {
+      var map:haxe.Constraints.IMap<Dynamic, Dynamic> = cast value;
+      var keyType:Null<CType> = null;
+      var valueType:Null<CType> = null;
+      var iterator:Iterator<Dynamic> = map.keys();
+      while (iterator.hasNext())
+      {
+        var key = iterator.next();
+        keyType = mergeInferredRuntimeTypes(keyType, inferRuntimeType(key));
+        valueType = mergeInferredRuntimeTypes(valueType, inferRuntimeType(map.get(key)));
+      }
+      return CTPath(['Map'], [keyType ?? CTPath(['Dynamic']), valueType ?? CTPath(['Dynamic'])]);
+    }
+    if (Std.isOfType(value, PolymodScriptClass))
+    {
+      var scriptClassName = Util.getScriptClassName(value);
+      if (scriptClassName != null) return CTPath(scriptClassName.split('.'));
+    }
+    if (Std.isOfType(value, PolymodStaticClassReference)) return CTPath(['polymod', 'hscript', '_internal', 'PolymodStaticClassReference']);
+    if (Std.isOfType(value, PolymodEnum.PolymodEnumValue))
+    {
+      var enumName = (cast value:PolymodEnum.PolymodEnumValue).parentEnum.getFullName();
+      return enumName == null ? null : CTPath(enumName.split('.'));
+    }
+
+    switch (Type.typeof(value))
+    {
+      case TInt: return CTPath(['Int']);
+      case TFloat: return CTPath(['Float']);
+      case TBool: return CTPath(['Bool']);
+      case TFunction: return null;
+      case TObject:
+        var objectFields:Array<{name:String, t:CType, ?meta:Metadata}> = [];
+        for (fieldName in Reflect.fields(value))
+          objectFields.push({name: fieldName, t: inferRuntimeType(Reflect.field(value, fieldName)) ?? CTPath(['Dynamic'])});
+        return CTAnon(objectFields);
+      case TClass(cls):
+        var className = Type.getClassName(cls);
+        return className == null ? null : CTPath(className.split('.'));
+      case TEnum(en):
+        var enumName = Type.getEnumName(en);
+        return enumName == null ? null : CTPath(enumName.split('.'));
+      default:
+        return null;
+    }
+  }
+
+  function mergeInferredRuntimeTypes(left:Null<CType>, right:Null<CType>):Null<CType>
+  {
+    if (left == null) return right;
+    if (right == null) return left;
+    if (isDynamicType(left) || isDynamicType(right)) return CTPath(['Dynamic']);
+
+    var printer = new Printer();
+    var leftName = printer.typeToString(left);
+    var rightName = printer.typeToString(right);
+    if (leftName == rightName) return left;
+
+    return CTPath(['Dynamic']);
+  }
+
+  function runtimeExpressionType(expression:Expr):Null<CType>
+  {
+    switch (Tools.expr(expression))
+    {
+      case EConst(CInt(_)):
+        return CTPath(['Int']);
+      case EConst(CFloat(_)):
+        return CTPath(['Float']);
+      case EConst(CString(_, _)):
+        return CTPath(['String']);
+      case EIdent('true') | EIdent('false'):
+        return CTPath(['Bool']);
+      case EIdent(name):
+        if (name == 'this' && _proxy != null)
+          return CTPath(_proxy.fullyQualifiedName.split('.'));
+        if (name == 'super' && _proxy != null && _proxy.superClass != null)
+        {
+          var superType = inferRuntimeType(_proxy.superClass);
+          if (superType != null) return superType;
+        }
+
+        var local = locals.get(name);
+        if (local != null)
+        {
+          if (local.t == null && local.r != null) local.t = inferRuntimeType(local.r);
+          return local.t;
+        }
+
+        if (_proxy != null)
+        {
+          var declaration = _proxy.findVar(name);
+          if (declaration != null && declaration.type != null) return declaration.type;
+
+          var instanceMemberType = runtimeMemberType(CTPath(_proxy.fullyQualifiedName.split('.')), name, false);
+          if (instanceMemberType != null) return instanceMemberType;
+        }
+
+        var classDecl = getClassDecl();
+        if (classDecl != null && _proxy == null)
+        {
+          var className = Util.getFullClassName(classDecl);
+          var staticMemberType = runtimeMemberType(CTPath(className.split('.')), name, true);
+          if (staticMemberType != null) return staticMemberType;
+        }
+
+        var knownType = variableTypes.get(name);
+        if (knownType != null) return knownType;
+        if (variables.exists(name))
+        {
+          knownType = inferRuntimeType(variables.get(name));
+          if (knownType != null) variableTypes.set(name, knownType);
+          return knownType;
+        }
+
+        if (classDecl != null)
+        {
+          var imported = classDecl.imports == null ? null : classDecl.imports.get(name);
+          if (imported == null && classDecl.importsToValidate != null)
+            imported = classDecl.importsToValidate.get(name);
+          if (imported != null && imported.field != true && imported.fullPath != null)
+            return CTPath(imported.fullPath.split('.'));
+        }
+
+        if (_scriptClassDescriptors.exists(name) || _scriptInterfaceDescriptors.exists(name) || _scriptEnumDescriptors.exists(name))
+          return CTPath(name.split('.'));
+
+        return null;
+
+      case EField(target, field):
+        return runtimeMemberType(runtimeExpressionType(target), field, runtimeTypeReferenceExpression(target));
+
+      case EArray(target, _):
+        return runtimeIndexedValueType(runtimeExpressionType(target));
+
+      case EArrayDecl(entries):
+        if (entries.length > 0)
+        {
+          var isMapLiteral = false;
+          switch (Tools.expr(entries[0]))
+          {
+            case EBinop('=>', _, _): isMapLiteral = true;
+            default:
+          }
+          if (isMapLiteral)
+          {
+            var keyType:Null<CType> = null;
+            var valueType:Null<CType> = null;
+            for (entry in entries)
+            {
+              switch (Tools.expr(entry))
+              {
+                case EBinop('=>', key, value):
+                  keyType = mergeInferredRuntimeTypes(keyType, runtimeExpressionType(key));
+                  valueType = mergeInferredRuntimeTypes(valueType, runtimeExpressionType(value));
+                default:
+              }
+            }
+            return CTPath(['Map'], [keyType ?? CTPath(['Dynamic']), valueType ?? CTPath(['Dynamic'])]);
+          }
+        }
+        var elementType:Null<CType> = null;
+        for (entry in entries)
+          elementType = mergeInferredRuntimeTypes(elementType, runtimeExpressionType(entry));
+        return CTPath(['Array'], [elementType ?? CTPath(['Dynamic'])]);
+
+      case EObject(fields):
+        return CTAnon([for (field in fields)
+          {name: field.name, t: runtimeExpressionType(field.e) ?? CTPath(['Dynamic'])}]);
+
+      case EParent(inner):
+        return runtimeExpressionType(inner);
+
+      case ENew(classPath, _):
+        return CTPath(resolveRuntimeTypePath(classPath.split('.')).split('.'));
+
+      case ECall(callee, _):
+        return switch (runtimeExpressionType(callee))
+        {
+          case CTFun(_, returnType): returnType;
+          case CTParent(CTFun(_, returnType)) | CTNamed(_, CTFun(_, returnType)) | CTOpt(CTFun(_, returnType)): returnType;
+          default: null;
+        };
+
+      case ETernary(_, first, second):
+        return mergeInferredRuntimeTypes(runtimeExpressionType(first), runtimeExpressionType(second));
+
+      case ECheckType(_, type):
+        return type;
+
+      case EFunction(args, _, _, ret):
+        return CTFun([for (arg in args)
+          arg.opt == true
+            ? CTOpt(arg.t ?? CTPath(['Dynamic']))
+            : (arg.t ?? CTPath(['Dynamic']))], ret ?? CTPath(['Dynamic']));
+
+      case ECast(_, type) if (type != null):
+        return type;
+
+      default:
+        return null;
+    }
+  }
+
+  function runtimeTypeReferenceExpression(expression:Expr):Bool
+  {
+    return switch (Tools.expr(expression))
+    {
+      case EIdent(name):
+        if (locals.exists(name) || variables.exists(name)) false
+        else
+        {
+          var classDecl = getClassDecl();
+          var imported = classDecl == null || classDecl.imports == null ? null : classDecl.imports.get(name);
+          if (imported == null && classDecl != null && classDecl.importsToValidate != null)
+            imported = classDecl.importsToValidate.get(name);
+          imported != null && imported.field != true;
+        }
+      default: false;
+    }
+  }
+
+  function runtimeMemberType(containerType:Null<CType>, fieldName:String, isStatic:Bool = false, depth:Int = 0):Null<CType>
+  {
+    if (containerType == null || depth > 24) return null;
+
+    return switch (containerType)
+    {
+      case CTParent(inner) | CTNamed(_, inner) | CTOpt(inner):
+        runtimeMemberType(inner, fieldName, isStatic, depth + 1);
+
+      case CTAnon(fields):
+        var result:Null<CType> = null;
+        for (field in fields)
+          if (field.name == fieldName)
+          {
+            result = field.t;
+            break;
+          }
+        result;
+
+      case CTPath(path, params):
+        if (path == null || path.length == 0) null
+        else
+        {
+          var fullName = resolveRuntimeTypePath(path);
+          var declaration = _scriptClassDescriptors.get(fullName);
+          if (declaration != null)
+          {
+            var declaredFields = isStatic ? declaration.staticFields : declaration.fields;
+            var result:Null<CType> = null;
+            for (field in declaredFields)
+            {
+              if (field.name != fieldName) continue;
+              switch (field.kind)
+              {
+                case KVar(variable): result = variable.type;
+                case KFunction(fn):
+                  result = CTFun([for (argument in fn.args)
+                    argument.opt == true ? CTOpt(argument.t ?? CTPath(['Dynamic'])) : (argument.t ?? CTPath(['Dynamic']))], fn.ret ?? CTPath(['Dynamic']));
+              }
+              if (result != null) return result;
+            }
+
+            if (!isStatic && declaration.extend != null)
+            {
+              result = runtimeMemberType(declaration.extend, fieldName, false, depth + 1);
+              if (result != null) return result;
+            }
+          }
+
+          #if POLYMOD_STRICT_SYNTAX
+          Typer.getRuntimeFieldType(fullName, fieldName, isStatic, params);
+          #else
+          null;
+          #end
+        }
+
+      default:
+        null;
+    }
+  }
+
+  function runtimeIndexedValueType(containerType:Null<CType>):Null<CType>
+  {
+    return switch (containerType)
+    {
+      case CTParent(inner) | CTNamed(_, inner) | CTOpt(inner): runtimeIndexedValueType(inner);
+      case CTPath(path, params) if (path != null && path.length > 0 && params != null):
+        switch (path[path.length - 1])
+        {
+          case 'Array' if (params.length > 0): params[0];
+          case 'Map' if (params.length > 1): params[1];
+          default: null;
+        }
+      default:
+        null;
+    }
+  }
+
+  function runtimeIndexedKeyType(containerType:Null<CType>):Null<CType>
+  {
+    return switch (containerType)
+    {
+      case CTParent(inner) | CTNamed(_, inner) | CTOpt(inner): runtimeIndexedKeyType(inner);
+      case CTPath(path, params) if (path != null && path.length > 0 && path[path.length - 1] == 'Map' && params != null && params.length > 1):
+        params[0];
+      default:
+        null;
+    }
+  }
+
+  function assertRuntimeCallArguments(callableType:Null<CType>, args:Array<Dynamic>, context:String):Null<CType>
+  {
+    if (callableType == null) return null;
+
+    return switch (callableType)
+    {
+      case CTParent(inner) | CTNamed(_, inner) | CTOpt(inner):
+        assertRuntimeCallArguments(inner, args, context);
+      case CTFun(parameterTypes, returnType):
+        var checkedArgs = args.length < parameterTypes.length ? args.length : parameterTypes.length;
+        for (i in 0...checkedArgs)
+        {
+          if (args[i] == '_') continue;
+          var expectedType = parameterTypes[i];
+          if (expectedType != null && !isRuntimeRestType(expectedType))
+            assertRuntimeType(args[i], expectedType, 'argument ${i + 1} of ${context}');
+        }
+        returnType;
+      default:
+        null;
+    }
+  }
+
+  function isRuntimeRestType(type:CType):Bool
+  {
+    return switch (type)
+    {
+      case CTPath(path, _): path != null && path.length > 0 && path[path.length - 1] == 'Rest';
+      case CTParent(inner) | CTNamed(_, inner) | CTOpt(inner): isRuntimeRestType(inner);
+      default: false;
+    }
+  }
+
+  function runtimeTypeMatches(value:Dynamic, type:CType, depth:Int):Bool
+  {
+    if (type == null || depth > 16) return true;
+
+    return switch (type)
+    {
+      case CTParent(inner) | CTNamed(_, inner): runtimeTypeMatches(value, inner, depth + 1);
+      case CTOpt(inner): value == null || runtimeTypeMatches(value, inner, depth + 1);
+      case CTFun(_, _): value == null || Reflect.isFunction(value);
+      case CTExpr(_): true;
+      case CTAnon(fields):
+        if (value == null) true else {
+          var matches = true;
+          for (field in fields)
+          {
+            if (!Reflect.hasField(value, field.name))
+            {
+              switch (field.t)
+              {
+                case CTOpt(_): continue;
+                default:
+                  matches = false;
+                  break;
+              }
+            }
+            if (!runtimeTypeMatches(Reflect.field(value, field.name), field.t, depth + 1))
+            {
+              matches = false;
+              break;
+            }
+          }
+          matches;
+        }
+      case CTPath(path, params):
+        if (path == null || path.length == 0) true else {
+          var rawName = path.join('.');
+          var typeName = path[path.length - 1];
+          if (typeName == 'Dynamic' || rawName == 'Dynamic' || typeName == 'Any') true
+          else if (typeName == 'Null' || rawName == 'Null') value == null || (params != null && params.length > 0 && runtimeTypeMatches(value, params[0], depth + 1))
+          else if (value == null)
+          {
+            switch (typeName)
+            {
+              case 'Int', 'Float', 'Bool': false;
+              default: true;
+            }
+          }
+          else if (typeName == 'Int')
+          {
+            switch (Type.typeof(value)) { case TInt: true; default: false; }
+          }
+          else if (typeName == 'Float')
+          {
+            switch (Type.typeof(value)) { case TInt, TFloat: true; default: false; }
+          }
+          else if (typeName == 'Bool')
+          {
+            switch (Type.typeof(value)) { case TBool: true; default: false; }
+          }
+          else if (typeName == 'String') Std.isOfType(value, String)
+          else if (typeName == 'Void') true
+          else if (typeName == 'Array')
+          {
+            if (!Std.isOfType(value, Array)) false
+            else if (params == null || params.length == 0 || isDynamicType(params[0])) true
+            else {
+              var matches = true;
+              for (item in (cast value:Array<Dynamic>))
+              {
+                if (!runtimeTypeMatches(item, params[0], depth + 1))
+                {
+                  matches = false;
+                  break;
+                }
+              }
+              matches;
+            }
+          }
+          else if (typeName == 'Map')
+          {
+            if (!isMap(value)) false
+            else if (params == null || params.length < 2 || (isDynamicType(params[0]) && isDynamicType(params[1]))) true
+            else
+            {
+              var map:haxe.Constraints.IMap<Dynamic, Dynamic> = cast value;
+              var matches = true;
+              var iterator:Iterator<Dynamic> = map.keys();
+              while (iterator.hasNext())
+              {
+                var key = iterator.next();
+                if (!runtimeTypeMatches(key, params[0], depth + 1) || !runtimeTypeMatches(map.get(key), params[1], depth + 1))
+                {
+                  matches = false;
+                  break;
+                }
+              }
+              matches;
+            }
+          }
+          else
+          {
+            var resolvedName = resolveRuntimeTypePath(path);
+            if (Std.isOfType(value, PolymodEnum.PolymodEnumValue))
+            {
+              return runtimeScriptEnumMatches(value, path, resolvedName);
+            }
+            else
+            {
+              #if POLYMOD_STRICT_SYNTAX
+              var abstractUnderlying = Typer.getRuntimeAbstractUnderlyingType(resolvedName, params);
+              #else
+              var abstractUnderlying:Null<CType> = null;
+              #end
+              if (abstractUnderlying != null)
+                runtimeTypeMatches(value, abstractUnderlying, depth + 1)
+              else
+              {
+                var nativeClass:Class<Dynamic> = PolymodScriptClass.importOverrides.get(resolvedName)
+                  ?? PolymodScriptClass.importOverrides.get(typeName)
+                  ?? PolymodScriptClass.typedefs.get(resolvedName)
+                  ?? Type.resolveClass(resolvedName);
+                if (nativeClass != null)
+                {
+                  if (Std.isOfType(value, PolymodScriptClass) || Util.getScriptClassName(value) != null)
+                    PolymodScriptClass.isOfType(value, nativeClass)
+                  else
+                    Std.isOfType(value, nativeClass);
+                }
+                else
+                {
+                  var classRef = PolymodStaticClassReference.tryBuild(resolvedName);
+                  if (classRef != null) PolymodScriptClass.isOfType(value, classRef)
+                  else
+                  {
+                    var interfaceRef = PolymodStaticInterfaceReference.tryBuild(resolvedName);
+                    if (interfaceRef != null) PolymodScriptClass.isOfType(value, interfaceRef)
+                    else
+                    {
+                      var enumRef = Type.resolveEnum(resolvedName);
+                      if (enumRef != null) Type.getEnum(value) == enumRef
+                      else if (PolymodScriptClass.abstractClassImpls.exists(resolvedName)) true
+                      else true;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+    }
+  }
+
+  function runtimeScriptEnumMatches(value:Dynamic, path:Array<String>, resolvedName:String):Bool
+  {
+    var enumValue:PolymodEnum.PolymodEnumValue = cast value;
+    var actualName = enumValue.parentEnum.getFullName();
+    var expectedName = resolveRuntimeScriptEnumPath(path, resolvedName);
+    return expectedName != null && actualName == expectedName;
+  }
+
+  function resolveRuntimeScriptEnumPath(path:Array<String>, resolvedName:String):Null<String>
+  {
+    if (_scriptEnumDescriptors.exists(resolvedName)) return resolvedName;
+
+    var requested = path.join('.');
+    if (_scriptEnumDescriptors.exists(requested)) return requested;
+    if (path.length != 1) return null;
+
+    var shortName = path[0];
+    var decl = getClassDecl();
+    if (decl != null)
+    {
+      var imp = decl.imports == null ? null : decl.imports.get(shortName);
+      if (imp == null && decl.importsToValidate != null) imp = decl.importsToValidate.get(shortName);
+      if (imp != null && imp.field != true && imp.fullPath != null && _scriptEnumDescriptors.exists(imp.fullPath))
+        return imp.fullPath;
+
+      var packageName = decl.pkg == null ? '' : decl.pkg.join('.');
+      if (packageName.length > 0)
+      {
+        var localName = packageName + '.' + shortName;
+        if (_scriptEnumDescriptors.exists(localName)) return localName;
+      }
+    }
+
+    var candidate:Null<String> = null;
+    for (name in _scriptEnumDescriptors.keys())
+    {
+      var parts = name.split('.');
+      if (parts[parts.length - 1] != shortName) continue;
+      if (candidate != null && candidate != name) return null;
+      candidate = name;
+    }
+    return candidate;
+  }
+
+  function isDynamicType(type:CType):Bool
+  {
+    return switch (type)
+    {
+      case CTPath(path, _): path != null && path.length > 0 && (path[path.length - 1] == 'Dynamic' || path[path.length - 1] == 'Any');
+      default: false;
+    }
+  }
+
+  function resolveRuntimeTypePath(path:Array<String>):String
+  {
+    var requested = path.join('.');
+    if (path.length != 1) return requested;
+
+    var shortName = path[0];
+    var decl = getClassDecl();
+    if (decl != null)
+    {
+      var imp = decl.imports == null ? null : decl.imports.get(shortName);
+      if (imp == null && decl.importsToValidate != null) imp = decl.importsToValidate.get(shortName);
+      if (imp != null && imp.fullPath != null && !imp.field) return imp.fullPath;
+
+      var packageName = decl.pkg == null ? '' : decl.pkg.join('.');
+      if (packageName.length > 0)
+      {
+        var localName = packageName + '.' + shortName;
+        if (_scriptClassDescriptors.exists(localName) || _scriptEnumDescriptors.exists(localName) || _scriptInterfaceDescriptors.exists(localName)) return localName;
+      }
+    }
+
+    var overridden = PolymodScriptClass.importOverrides.get(shortName);
+    if (overridden != null)
+    {
+      var overriddenName = Type.getClassName(overridden);
+      if (overriddenName != null) return overriddenName;
+    }
+
+    for (name => cls in PolymodScriptClass.defaultImports)
+    {
+      if (name == shortName || name.split('.').pop() == shortName)
+      {
+        var defaultName = Type.getClassName(cls);
+        if (defaultName != null) return defaultName;
+      }
+    }
+    return requested;
   }
 
   /**
@@ -2630,6 +3375,19 @@ class Interp
    * @return The parsed expression.
    */
   public function exprWithType(e:Expr, ?t:CType):Dynamic
+  {
+    var value = exprWithTypeUnchecked(e, t);
+    if (t != null)
+    {
+      #if hscriptPos
+      curExpr = e;
+      #end
+      assertRuntimeType(value, t, 'typed expression');
+    }
+    return value;
+  }
+
+  function exprWithTypeUnchecked(e:Expr, ?t:CType):Dynamic
   {
     if (t == null)
     {
@@ -2792,7 +3550,7 @@ class Interp
           n: v,
           old: locals.get(v),
         });
-        locals.set(v, {r: val});
+        locals.set(v, {r: val, t: inferRuntimeType(val)});
 
         return true;
       case EIdent(v) if (v != 'true' && v != 'false'):
@@ -2829,7 +3587,7 @@ class Interp
             old: locals.get(v)
           });
         }
-        locals.set(v, {r: val});
+        locals.set(v, {r: val, t: inferRuntimeType(val)});
 
         return true;
       case EField(e, f) if (isScriptEnumValue):
@@ -3262,12 +4020,39 @@ class Interp
       n: n,
       old: locals.get(n)
     });
-    var it = makeIterator(expr(it));
-    while (it.hasNext())
+
+    var iterableValue:Dynamic = expr(it);
+    var loopType:Null<CType> = runtimeIndexedValueType(runtimeExpressionType(it));
+
+    if (Std.isOfType(iterableValue, Array))
     {
-      locals.set(n, {
-        r: it.next()
-      });
+      var values:Array<Dynamic> = cast iterableValue;
+      var inferredLoopType:Null<CType> = null;
+      for (value in values)
+      {
+        var valueType = inferRuntimeType(value);
+        if (value != null && valueType == null)
+        {
+          inferredLoopType = CTPath(['Dynamic']);
+          break;
+        }
+        inferredLoopType = mergeInferredRuntimeTypes(inferredLoopType, valueType);
+      }
+      loopType = mergeInferredRuntimeTypes(loopType, inferredLoopType);
+    }
+
+    var hasLoopType = loopType != null;
+    var iterator = makeIterator(iterableValue);
+    while (iterator.hasNext())
+    {
+      var item:Dynamic = iterator.next();
+      if (!hasLoopType)
+      {
+        loopType = inferRuntimeType(item);
+        hasLoopType = true;
+      }
+      locals.set(n, {r: item, t: loopType});
+      assertRuntimeType(item, loopType, 'for-loop variable "${n}"');
       if (!loopRun(() -> expr(e))) break;
     }
     restore(old);
@@ -3284,16 +4069,56 @@ class Interp
       n: vv,
       old: locals.get(vv)
     });
-    var it = makeKeyValueIterator(expr(it));
-    while (it.hasNext())
+
+    var iterableValue:Dynamic = expr(it);
+    var iterableType = runtimeExpressionType(it);
+    var keyType:Null<CType> = runtimeIndexedKeyType(iterableType);
+    var valueType:Null<CType> = runtimeIndexedValueType(iterableType);
+
+    if (isMap(iterableValue))
     {
-      var v = it.next();
-      locals.set(vk, {
-        r: v.key
-      });
-      locals.set(vv, {
-        r: v.value
-      });
+      var map:haxe.Constraints.IMap<Dynamic, Dynamic> = cast iterableValue;
+      var inferredKeyType:Null<CType> = null;
+      var inferredValueType:Null<CType> = null;
+      for (key in map.keys())
+      {
+        var inferredKey = inferRuntimeType(key);
+        if (key != null && inferredKey == null)
+          inferredKeyType = CTPath(['Dynamic']);
+        else
+          inferredKeyType = mergeInferredRuntimeTypes(inferredKeyType, inferredKey);
+
+        var mapValue = map.get(key);
+        var inferredValue = inferRuntimeType(mapValue);
+        if (mapValue != null && inferredValue == null)
+          inferredValueType = CTPath(['Dynamic']);
+        else
+          inferredValueType = mergeInferredRuntimeTypes(inferredValueType, inferredValue);
+      }
+      keyType = mergeInferredRuntimeTypes(keyType, inferredKeyType);
+      valueType = mergeInferredRuntimeTypes(valueType, inferredValueType);
+    }
+
+    var hasKeyType = keyType != null;
+    var hasValueType = valueType != null;
+    var iterator = makeKeyValueIterator(iterableValue);
+    while (iterator.hasNext())
+    {
+      var v = iterator.next();
+      if (!hasKeyType)
+      {
+        keyType = inferRuntimeType(v.key);
+        hasKeyType = true;
+      }
+      if (!hasValueType)
+      {
+        valueType = inferRuntimeType(v.value);
+        hasValueType = true;
+      }
+      locals.set(vk, {r: v.key, t: keyType});
+      locals.set(vv, {r: v.value, t: valueType});
+      assertRuntimeType(v.key, keyType, 'map key variable "${vk}"');
+      assertRuntimeType(v.value, valueType, 'map value variable "${vv}"');
       if (!loopRun(() -> expr(e))) break;
     }
     restore(old);
@@ -4168,6 +4993,8 @@ class Interp
             meta: e.meta,
             params: e.params,
             isPrivate: e.isPrivate,
+            imports: imports,
+            importsToValidate: importsToValidate,
             fields: e.fields,
           };
 
@@ -5189,13 +6016,15 @@ class Interp
           {
             case EScriptThrow(errValue): errValue;
             default: error;
-          }
+          },
+          t: catchExpr.t
         });
       }
       else
       {
         locals.set(n, {
-          r: err
+          r: err,
+          t: catchExpr.t
         });
       }
       var v:Dynamic = expr(catchExpr.e);
@@ -5345,7 +6174,7 @@ class Interp
               case 'default':
                 if (!this.variables.exists(prefixedName))
                 {
-                  var result = this.expr(v.expr);
+                  var result = this.exprWithType(v.expr, v.type);
                   this.variables.set(prefixedName, result);
                   return result;
                 }
@@ -5361,7 +6190,7 @@ class Interp
           }
           else if (v.expr != null)
           {
-            var result = this.expr(v.expr);
+            var result = this.exprWithType(v.expr, v.type);
             this.variables.set(prefixedName, result);
             return result;
           }
@@ -5411,6 +6240,7 @@ class Interp
           {
             throw 'Cannot override final static field ${prefixedName}';
           }
+          value = assertRuntimeType(value, v.type, 'static field "${prefixedName}"');
           if (v.set != null)
           {
             switch (v.set)
@@ -5502,6 +6332,7 @@ typedef LocalVar =
 {
   var r:Dynamic;
   var ?isfinal:Bool;
+  var ?t:CType;
 }
 private class ArrayIterator<T>
 {

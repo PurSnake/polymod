@@ -5,6 +5,7 @@ import haxe.macro.Context;
 import haxe.macro.Expr;
 import haxe.macro.Type;
 import haxe.macro.Type.ClassType;
+import haxe.macro.Type.TypeParameter;
 import polymod.util.MacroUtil;
 #end
 
@@ -54,6 +55,16 @@ class PolymodScriptClassMacro
     }
 
     return macro polymod.hscript._internal.PolymodScriptClassMacro.fetchTypedefs();
+  }
+
+  public static macro function listTypeMetadata():ExprOf<Array<Dynamic>>
+  {
+    if (!onGenerateCallbackRegistered)
+    {
+      onGenerateCallbackRegistered = true;
+      haxe.macro.Context.onGenerate(onGenerate);
+    }
+    return macro polymod.hscript._internal.ScriptTypeMetadata.fetchTypeMetadata();
   }
 
   /**
@@ -112,6 +123,8 @@ class PolymodScriptClassMacro
     var typedefEntries:Array<Array<String>> = [];
     var interfaces:Map<String, Array<Dynamic>> = [];
     var classesExtendingInterfaces:Map<String, Array<String>> = [];
+    var typeEntries:Array<Dynamic> = [];
+    var typeNames:Map<String, Bool> = new Map();
     var interfaceCount:Int = 0;
 
     var startTime:Float = Sys.time();
@@ -121,11 +134,21 @@ class PolymodScriptClassMacro
       switch (type)
       {
         case TInst(t, _params):
-          // Parse classes to check if they are `HScriptedClass` implementations, for processing later.
-
           var classType:ClassType = t.get();
+          switch (classType.kind)
+          {
+            case KTypeParameter(_), KExpr(_): continue;
+            default:
+          }
+          // Parse classes to check if they are `HScriptedClass` implementations, for processing later.
           var classPack:String = classType.pack.join('.');
           var classPath:String = t.toString();
+
+          if (!typeNames.exists(classPath))
+          {
+            typeNames.set(classPath, true);
+            typeEntries.push(classTypeToMetadata(classPath, classType));
+          }
 
           if (classType.isInterface)
           {
@@ -236,6 +259,17 @@ class PolymodScriptClassMacro
           addPackageClass(classPack, classPath);
         case TType(t, _params):
           var typedefPath:String = t.toString();
+          if (!typeNames.exists(typedefPath))
+          {
+            typeNames.set(typedefPath, true);
+            var typedefType = t.get();
+            typeEntries.push({
+              kind: 'typedef',
+              name: typedefPath,
+              params: [for (param in typedefType.params) scopedParamName(typedefPath, param.name)],
+              type: typeToMetadata(typedefType.type, 0, scopedTypeParameters(typedefType.params, typedefPath)),
+            });
+          }
           var typedefTarget:Type = Context.followWithAbstracts(type);
 
           switch (typedefTarget)
@@ -286,6 +320,12 @@ class PolymodScriptClassMacro
           var abstractPack:String = abstractType.pack.join('.');
           var abstractImpl = abstractType.impl?.get();
 
+          if (!typeNames.exists(abstractPath))
+          {
+            typeNames.set(abstractPath, true);
+            typeEntries.push(abstractTypeToMetadata(abstractPath, abstractType));
+          }
+
           if (abstractImpl == null)
           {
             // If the abstract doesn't have an implementation, it's usually an extern or something, so we always want to ignore it.
@@ -312,6 +352,33 @@ class PolymodScriptClassMacro
 
           abstractImplEntries.push(entryData);
           addPackageClass(abstractPack, abstractPath);
+        case TEnum(t, _params):
+          var enumPath:String = t.toString();
+          if (!typeNames.exists(enumPath))
+          {
+            typeNames.set(enumPath, true);
+            var enumType = t.get();
+            var constructors:Array<Dynamic> = [];
+            for (constructorName in enumType.constructs.keys())
+            {
+              var constructor = enumType.constructs.get(constructorName).get();
+              var args:Array<Dynamic> = [];
+              switch (constructor.type)
+              {
+                case TFun(functionArgs, _):
+                  for (arg in functionArgs)
+                    args.push({name: arg.name, opt: arg.opt, type: typeToMetadata(arg.t, 0, scopedTypeParameters(enumType.params, enumPath))});
+                default:
+              }
+              constructors.push({name: constructorName, args: args});
+            }
+            typeEntries.push({
+              kind: 'enum',
+              name: enumPath,
+              params: [for (param in enumType.params) scopedParamName(enumPath, param.name)],
+              constructors: constructors,
+            });
+          }
         default:
           continue;
       }
@@ -323,6 +390,7 @@ class PolymodScriptClassMacro
       packages: packageEntries,
       interfaceEntries: interfaces,
       extendingInterfaces: classesExtendingInterfaces,
+      typeEntries: typeEntries,
     };
 
     var metaDataHXSF = haxe.Serializer.run(metaData);
@@ -606,6 +674,219 @@ class PolymodScriptClassMacro
     }
   }
 
+  static function classTypeToMetadata(path:String, cls:ClassType):Dynamic
+  {
+    var classTypeParams = scopedTypeParameters(cls.params, path);
+    var superType:Dynamic = null;
+    if (cls.superClass != null)
+      superType = typeToMetadata(TInst(cls.superClass.t, cls.superClass.params), 0, classTypeParams);
+
+    var interfaces:Array<Dynamic> = [];
+    for (interfaceType in cls.interfaces)
+      interfaces.push(typeToMetadata(TInst(interfaceType.t, interfaceType.params), 0, classTypeParams));
+
+    var fields:Array<Dynamic> = [];
+    for (field in cls.fields.get())
+      if (!hasNoScriptMeta(field)) fields.push(fieldToMetadata(field, cls.params, path));
+
+    var statics:Array<Dynamic> = [];
+    for (field in cls.statics.get())
+      if (!hasNoScriptMeta(field)) statics.push(fieldToMetadata(field, cls.params, path));
+
+    var constructor:Dynamic = null;
+    if (cls.constructor != null && !hasNoScriptMeta(cls.constructor.get()))
+      constructor = fieldToMetadata(cls.constructor.get(), cls.params, path);
+
+    return {
+      kind: 'class',
+      name: path,
+      params: [for (param in cls.params) scopedParamName(path, param.name)],
+      superType: superType,
+      interfaces: interfaces,
+      fields: fields,
+      statics: statics,
+      constructor: constructor,
+      isInterface: cls.isInterface,
+    };
+  }
+
+  static function abstractTypeToMetadata(path:String, abs:AbstractType):Dynamic
+  {
+    var abstractTypeParams = scopedTypeParameters(abs.params, path);
+    var from:Array<Dynamic> = [for (fromType in abs.from) typeToMetadata(fromType.t, 0, abstractTypeParams)];
+    var to:Array<Dynamic> = [for (toType in abs.to) typeToMetadata(toType.t, 0, abstractTypeParams)];
+    var fields:Array<Dynamic> = [];
+    var statics:Array<Dynamic> = [];
+    var impl = abs.impl == null ? null : abs.impl.get();
+    var fieldOwnerParams = impl == null ? abs.params : abs.params.concat(impl.params);
+
+    if (impl != null)
+    {
+      for (field in impl.fields.get())
+      {
+        if (hasNoScriptMeta(field)) continue;
+        var metadata = fieldToMetadata(field, fieldOwnerParams, path);
+        switch (field.type)
+        {
+          case TFun(args, ret) if (args.length > 0 && args[0].name == 'this')
+            metadata.type = {
+              kind: 'function',
+              functionArgs: [for (arg in args.slice(1)) {name: arg.name, opt: arg.opt, type: typeToMetadata(arg.t, 0, fieldTypeParameters(field, fieldOwnerParams, path))}],
+              ret: typeToMetadata(ret, 0, fieldTypeParameters(field, fieldOwnerParams, path)),
+              args: [],
+            };
+          default:
+        }
+        fields.push(metadata);
+      }
+
+      for (field in impl.statics.get())
+        if (!hasNoScriptMeta(field)) statics.push(fieldToMetadata(field, fieldOwnerParams, path));
+    }
+
+    return {
+      kind: 'abstract',
+      name: path,
+      params: [for (param in abs.params) scopedParamName(path, param.name)],
+      underlying: typeToMetadata(abs.type, 0, abstractTypeParams),
+      from: from,
+      to: to,
+      fields: fields,
+      statics: statics,
+    };
+  }
+
+  static function fieldToMetadata(field:ClassField, ownerParams:Array<TypeParameter> = null, ownerPath:String = ''):Dynamic
+  {
+    if (ownerParams == null) ownerParams = [];
+    var typeParams = fieldTypeParameters(field, ownerParams, ownerPath);
+    var canWrite = false;
+    switch (field.kind)
+    {
+      case FVar(_, write):
+        canWrite = switch (write)
+        {
+          case AccNormal, AccCall, AccInline: true;
+          default: false;
+        }
+      default:
+    }
+
+    return {
+      name: field.name,
+      isPublic: field.isPublic,
+      canWrite: canWrite,
+      complete: !field.name.startsWith('__'),
+      params: [for (param in field.params) scopedParamName(ownerPath + '#' + field.name, param.name)],
+      type: typeToMetadata(field.type, 0, typeParams),
+    };
+  }
+
+  static function hasNoScriptMeta(field:ClassField):Bool
+  {
+    for (meta in field.meta.get())
+      if (meta.name == ':noScript') return true;
+    return false;
+  }
+
+  static function hasOptionalMeta(field:ClassField):Bool
+  {
+    for (meta in field.meta.get())
+      if (meta.name == ':optional') return true;
+    return false;
+  }
+
+  static inline function scopedParamName(scope:String, name:String):String
+  {
+    return scope.length == 0 ? name : scope + '#' + name;
+  }
+
+  static function scopedTypeParameters(params:Array<TypeParameter>, scope:String):Array<{type:ClassType, name:String}>
+  {
+    return extendScopedTypeParameters([], params, scope);
+  }
+
+  static function extendScopedTypeParameters(existing:Array<{type:ClassType, name:String}>, params:Array<TypeParameter>, scope:String):Array<{type:ClassType, name:String}>
+  {
+    var result = existing.copy();
+    for (param in params)
+      switch (param.t)
+      {
+        case TInst(ref, _):
+          result.push({type: ref.get(), name: scopedParamName(scope, param.name)});
+        default:
+      }
+    return result;
+  }
+
+  static function fieldTypeParameters(field:ClassField, ownerParams:Array<TypeParameter>, ownerPath:String):Array<{type:ClassType, name:String}>
+  {
+    var result = scopedTypeParameters(ownerParams, ownerPath);
+    return extendScopedTypeParameters(result, field.params, ownerPath + '#' + field.name);
+  }
+
+  static function typeToMetadata(type:Type, depth:Int = 0, typeParams:Array<{type:ClassType, name:String}> = null):Dynamic
+  {
+    if (depth > 32) return {kind: 'dynamic'};
+    if (typeParams == null) typeParams = [];
+
+    return switch (type)
+    {
+      case TMono(_), TDynamic(_): {kind: 'dynamic'};
+      case TInst(ref, args):
+        var classType = ref.get();
+        switch (classType.kind)
+        {
+          case KTypeParameter(_):
+            var paramName = classType.name;
+            for (parameter in typeParams)
+              if (parameter.type == classType)
+              {
+                paramName = parameter.name;
+                break;
+              }
+            {kind: 'param', name: paramName};
+          case KExpr(_): {kind: 'dynamic'};
+          default:
+            var name = ref.toString();
+            {kind: 'class', name: name, args: [for (arg in args) typeToMetadata(arg, depth + 1, typeParams)]};
+        }
+      case TEnum(ref, args):
+        {kind: 'enum', name: ref.toString(), args: [for (arg in args) typeToMetadata(arg, depth + 1, typeParams)]};
+      case TType(ref, args):
+        {kind: 'typedef', name: ref.toString(), args: [for (arg in args) typeToMetadata(arg, depth + 1, typeParams)]};
+      case TAbstract(ref, args):
+        var name = ref.toString();
+        var shortName = name.split('.').pop();
+        if (['Int', 'Float', 'Bool', 'Void'].contains(name)
+          || (name.startsWith('StdTypes.') && ['Int', 'Float', 'Bool', 'Void'].contains(shortName)))
+          {kind: 'primitive', name: shortName}
+        else if (name == 'Null' || name == 'StdTypes.Null')
+          {kind: 'null', name: 'Null', args: args.length == 0 ? [{kind: 'dynamic'}] : [for (arg in args) typeToMetadata(arg, depth + 1, typeParams)]}
+        else
+          {kind: 'abstract', name: name, args: [for (arg in args) typeToMetadata(arg, depth + 1, typeParams)]};
+      case TFun(args, ret):
+        {
+          kind: 'function',
+          args: [],
+          functionArgs: [for (arg in args) {name: arg.name, opt: arg.opt, type: typeToMetadata(arg.t, depth + 1, typeParams)}],
+          ret: typeToMetadata(ret, depth + 1, typeParams),
+        };
+      case TAnonymous(anon):
+        {
+          kind: 'anonymous',
+          fields: [for (field in anon.get().fields) if (!hasNoScriptMeta(field))
+            {
+              name: field.name,
+              opt: hasOptionalMeta(field),
+              type: typeToMetadata(field.type, depth + 1, typeParams),
+            }],
+        };
+      case TLazy(lazy): typeToMetadata(lazy(), depth + 1, typeParams);
+      default: {kind: 'dynamic'};
+    }
+  }
+
   static function fetchVarAccess(access:haxe.macro.Type.VarAccess):Null<String>
   {
     return switch (access)
@@ -628,6 +909,7 @@ class PolymodScriptClassMacro
     _metadata = haxe.Unserializer.run(metaDataHXSF);
     return _metadata;
   }
+
 
   public static function fetchAbstractImpls():Map<String, AbstractImplEntry>
   {
